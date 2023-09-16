@@ -1,7 +1,8 @@
+use core::slice;
 use kvm_bindings::{kvm_userspace_memory_region, KVM_MEM_LOG_DIRTY_PAGES};
 use kvm_ioctls::{Kvm, VmFd};
 use libc;
-use std::ptr::null_mut;
+use std::{io::Write, ptr::null_mut};
 
 pub struct Vm {
     fd: VmFd,
@@ -46,6 +47,49 @@ impl Vm {
         };
         unsafe {
             vm_fd.set_user_memory_region(mem_region).unwrap();
+        }
+
+        // Write code in the guest memory
+        let asm_code: &[u8];
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            asm_code = &[
+                0xba, 0xf8, 0x03, /* mov $0x3f8, %dx */
+                0x00, 0xd8, /* add %bl, %al */
+                0x04, b'0', /* add $'0', %al */
+                0xee, /* out %al, %dx */
+                0xec, /* in %dx, %al */
+                0xc6, 0x06, 0x00, 0x80,
+                0x00, /* movl $0, (0x8000); This generates a MMIO Write. */
+                0x8a, 0x16, 0x00, 0x80, /* movl (0x8000), %dl; This generates a MMIO Read. */
+                0xf4, /* hlt */
+            ];
+        }
+        unsafe {
+            let mut slice = slice::from_raw_parts_mut(load_addr, mem_size);
+            slice.write(&asm_code).unwrap();
+        }
+
+        // Create vCPU
+        // Call ioctl with KVM_CREATE_VCPU internally
+        let vcpu_fd = vm_fd.create_vcpu(0).unwrap();
+
+        // Initialize registers
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            // specific registers
+            let mut vcpu_sregs = vcpu_fd.get_sregs().unwrap();
+            vcpu_sregs.cs.base = 0;
+            vcpu_sregs.cs.selector = 0;
+            vcpu_fd.set_sregs(&vcpu_sregs).unwrap();
+
+            // general registers
+            let mut vcpu_regs = vcpu_fd.get_regs().unwrap();
+            vcpu_regs.rip = guest_addr;
+            vcpu_regs.rax = 2;
+            vcpu_regs.rbx = 3;
+            vcpu_regs.rflags = 2;
+            vcpu_fd.set_regs(&vcpu_regs).unwrap();
         }
 
         Ok(Vm {
